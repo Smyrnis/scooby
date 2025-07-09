@@ -15,11 +15,11 @@
 #include <linux/limits.h>
 
 #define PORT 8080
-#define BUFFER_SIZE 4096
+#define BUFFER_SIZE 8192
 #define WEB_ROOT "./www"
 #define THREAD_POOL_SIZE 8
 #define QUEUE_SIZE 64
-#define MAX_HEADERS 50
+#define MAX_HEADERS 32
 
 
 void log_request(const char *client_ip, const char *method, const char *path, int status_code);
@@ -426,17 +426,30 @@ void *worker_thread(void *arg) {
     char buffer[BUFFER_SIZE];
     http_header_t headers[MAX_HEADERS];
     int header_count = 0;
+
     while(running) {
         client_task_t task = dequeue();
         if (task.client_fd == -1) break;// Shutdown signal - exit thread.
 
-        int bytes_read = read(task.client_fd, buffer, BUFFER_SIZE - 1);
-        if (bytes_read <= 0) {
-            printf("Client disconnected or read error: %d\n", bytes_read);
-            close(task.client_fd);
-            continue;
+        int total_read = 0;
+        int header_end = -1;
+
+        // Read headers fully first:
+        while (total_read < BUFFER_SIZE - 1) {
+            int r = read(task.client_fd, buffer + total_read, BUFFER_SIZE - 1 - total_read);
+            if (r <= 0) {
+                close(task.client_fd);
+                return NULL;
+            }
+            total_read += r;
+            buffer[total_read] = '\0';
+
+            char *pos = strstr(buffer, "\r\n\r\n");
+            if (pos) {
+                header_end = (pos - buffer) + 4;
+                break;
+            }
         }
-        buffer[bytes_read] = '\0'; //null-termiante
 
         // Parse request line 
         char method[8], path[1024], version[16];
@@ -448,11 +461,12 @@ void *worker_thread(void *arg) {
             close(task.client_fd);
             continue;
         }
+        //Parse headers
         header_count = 0;
         while ((line = strtok_r(NULL, "\r\n", &saveptr)) && header_count < MAX_HEADERS)
         {
             if (line[0] == '\0') break;// End of headers.
-            // Split line into key and value by ":"
+
             char *sep = strchr(line, ':');
             if (sep && sep != line) {
                 size_t key_len = sep - line;
@@ -461,106 +475,103 @@ void *worker_thread(void *arg) {
 
                 strncpy(headers[header_count].key, line, key_len);
                 headers[header_count].key[key_len] = '\0';
-                //Skip any space after colon.
+                
                 char  *value_start = sep + 1;
                 while (*value_start == ' ') value_start++;
-                //Skp ": "(colon and space).
+                
                 strncpy(headers[header_count].value, value_start, sizeof(headers[header_count].value) - 1);
                 headers[header_count].value[sizeof(headers[header_count].value) - 1] = '\0';
 
                 header_count++;
             }
         }
+        // Convert client IP to readable string
+        char client_ip[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &(task.client_addr.sin_addr), client_ip, INET_ADDRSTRLEN);
 
- if(strcmp(method,"POST") == 0) {
-    int content_length = 0;
-    for (int i = 0; i < header_count; i++) {
-        if (strcasecmp(headers[i].key, "Content-Length") == 0) {
-            content_length = atoi(headers[i].value);
-            break;
+        // POST method..Handle 
+        if(strcmp(method, "POST") == 0) {
+            int content_length = 0;
+            for (int i = 0; i < header_count; i++) {
+                if (strcasecmp(headers[i].key, "Content-Length") == 0) {
+                    content_length = atoi(headers[i].value);
+                    break;
+                }
+            }
+
+            if (content_length <= 0 || content_length > 10 * 1024 * 1024) {
+                const char *msg = "HTTP/1.1 411 Length Required\r\nContent-Length: 0\r\n\r\n";
+                write(task.client_fd, msg, strlen(msg));
+                shutdown(task.client_fd, SHUT_WR);
+                close(task.client_fd);
+                return NULL;
+            }
+
+            char *body = malloc(content_length + 1);
+            if (!body) {
+                //Handle memory failure
+                const char *msg = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n";
+                write(task.client_fd, msg, strlen(msg));
+                shutdown(task.client_fd, SHUT_WR);
+                close(task.client_fd);
+                return NULL;
+            }
+            // Calc how many body bytes we already have in buffer.
+            int body_in_buffer = total_read - header_end;
+            if (body_in_buffer > content_length)
+                body_in_buffer = content_length;
+
+            memcpy(body, buffer + header_end, body_in_buffer);
+
+            int body_received = body_in_buffer;
+            while (body_received < content_length) {
+                int r = read(task.client_fd, body + body_received, content_length - body_received);
+                if (r <= 0) break;
+                body_received += r;
+            }
+            body[content_length] = '\0';
+
+            // Send the response header and echo body.
+            char response_header[256];
+            snprintf(response_header, sizeof(response_header),
+                "HTTP/1.1 200 OK\r\n"
+                "Content-Type: text/plain\r\n"
+                "Content-Length: %d\r\n"
+                "Connection: close\r\n\r\n",
+                content_length);
+
+            if (write(task.client_fd, response_header, strlen(response_header)) < 0 ||
+                write(task.client_fd, body, content_length) < 0) {
+                perror("write");//Report if something went wrong.
+            }
+            // LOGGING: move client_ip above this block (see note below)
+            printf("Received POST: %.*s\n", content_length, body);
+            log_request(client_ip, method, path, 200);
+
+            free(body);
+            shutdown(task.client_fd, SHUT_WR);
+            close(task.client_fd);
+            return NULL; // EXIT cleanly
         }
-    }
-
-    if (content_length <= 0 || content_length > 10 * 1024 * 1024) {
-        //Arbitrary 10 MB limit to avoid abuse.
-        const char *msg = "HTTP/1.1 411 Length Required\r\nContent-Length: 0\r\n\r\n";
-        write(task.client_fd, msg, strlen(msg));
-        close(task.client_fd);
-        continue;
-    }
-
-    char *body_start = strstr(buffer, "\r\n\r\n");
-    if (!body_start) {
-        close(task.client_fd);
-        continue;
-    }
-    body_start += 4;
-
-    int header_offset = body_start - buffer;
-    int body_received = bytes_read - header_offset;
-    
-    char *body = malloc(content_length + 1);
-    if (!body) {
-        //Handle memory failure
-        const char *msg = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n";
-        write(task.client_fd, msg, strlen(msg));
-        close(task.client_fd);
-        continue;
-    }
-    memcpy(body, body_start, body_received);
-
-    while (body_received < content_length) {
-        int r = read(task.client_fd, body + body_received, content_length - body_received);
-        if (r <= 0) break;
-        body_received += r;
-    }
-
-    body[content_length] = '\0';
-    int status_code = 200;
-
-    //Response with echo for body, just to check.
-    char response_header[256];
-    snprintf(response_header, sizeof(response_header),
-            "HTTP/1.1 200 OK\r\n"
-            "Content-Type: text/plain\r\n"
-            "Content-Length: %d\r\n"
-            "Connection: close\r\n\r\n",
-            content_length);
-    
-    if  (write(task.client_fd, response_header, strlen(response_header)) < 0 ||
-        write(task.client_fd, body, content_length) < 0) {
-            perror("write");//Report if something went wrong.
-        }
-
-    //Flush and close
-    shutdown(task.client_fd, SHUT_WR); //Grace shutdown.
-    free(body);
-    close(task.client_fd);
- }
         
-// Convert client IP to readable string
-    char client_ip[INET_ADDRSTRLEN];
-    inet_ntop(AF_INET, &(task.client_addr.sin_addr), client_ip, INET_ADDRSTRLEN);
-
-    // Default to 404 if method is unsupported
-    int status_code = 404;
-    if (strcmp(method, "GET") == 0 || strcmp(method, "HEAD") == 0) {
-        status_code = server_file(task.client_fd, method, path, task.client_addr, strcmp(method, "HEAD") == 0);
-    } else {
-        const char *msg = 
-            "HTTP/1.1 405 Method Not Allowed\r\n"
-            "Allow: GET, HEAD, POST\r\n"
-            "Content-Length: 0\r\n\r\n";
-        write(task.client_fd, msg, strlen(msg));
-        status_code = 405;
-    }
-
-    // Log the request, check log_request helper function.
-    log_request(client_ip, method, path, status_code);
-
+        // Default to 404 if method is unsupported
+        int status_code = 404;
+        if (strcmp(method, "GET") == 0 || strcmp(method, "HEAD") == 0) {
+            status_code = server_file(task.client_fd, method, path, task.client_addr, strcmp(method, "HEAD") == 0);
+        } else {
+            const char *msg = 
+                "HTTP/1.1 405 Method Not Allowed\r\n"
+                "Allow: GET, HEAD, POST\r\n"
+                "Content-Length: 0\r\n\r\n";
+            write(task.client_fd, msg, strlen(msg));
+            status_code = 405;
+        }
+    
+        log_request(client_ip, method, path, status_code);
         close(task.client_fd);
         }
-        return NULL;
+
+    return NULL;
 }
 
 int main() {
