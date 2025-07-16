@@ -13,17 +13,28 @@
 #include <time.h>
 #include <ctype.h>
 #include <linux/limits.h>
+#include <openssl/ssl.h>
+#include <openssl/err.h>
 
-#define PORT 8080
+#define HTTP_PORT 8080
+#define HTTPS_PORT 8443
 #define BUFFER_SIZE 8192
 #define WEB_ROOT "./www"
 #define THREAD_POOL_SIZE 8
 #define QUEUE_SIZE 64
 #define MAX_HEADERS 32
 
+#define MAX_REQUEST_SIZE 65536
+#define MAX_HEADER_SIZE 8192
+#define MAX_PATH_LENGTH 2048
+#define MAX_METHOD_LENGTH 16
+#define MAX_HEADER_NAME_LENGTH 128
+#define MAX_HEADER_VALUE_LENGTH 4096
+
+SSL_CTX *ssl_ctx = NULL;
 
 void log_request(const char *client_ip, const char *method, const char *path, int status_code);
-
+bool validate_http_path(const char *path);
 
 FILE *log_file = NULL;
 pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -33,8 +44,11 @@ typedef struct {
 } http_header_t;
 typedef struct {
     int client_fd;
+    SSL *ssl;
     struct sockaddr_in client_addr;
+    bool is_https;
 } client_task_t;
+void enqueue_task(client_task_t task);
 
 int server_fd;
 volatile bool running = true;//Server running flag.
@@ -72,13 +86,28 @@ const char *get_mime_type(const char *path) {
     return "application/octet-stream";//fallback for unkown type.
 }
 
-void send_404(int client_fd, struct sockaddr_in client_addr, const char *path) {
+//SSL-aware read/write wrappers
+int ssl_read(SSL *ssl, int fd, void *buf, int len) {
+    if (ssl) {
+        return SSL_read(ssl, buf, len);
+    }
+    return read(fd, buf, len);
+}
+
+int ssl_write(SSL *ssl, int fd, const void *buf, int len) {
+    if (ssl) {
+        return SSL_write(ssl, buf, len);
+    }
+    return write(fd, buf, len);
+}
+
+void send_404(int client_fd, SSL *ssl, struct sockaddr_in client_addr, const char *path) {
     const char *error_path = WEB_ROOT "/404.html";
     int fd = open(error_path, O_RDONLY);
     if (fd == -1) {
         // fallback plain text
         const char *msg = "HTTP/1.1 404 Not Found\r\nContent-Length: 13\r\nContent-Type: text/plain\r\n\r\n404 Not Found";
-        write(client_fd, msg, strlen(msg));
+        ssl_write(ssl, client_fd, msg, strlen(msg));
         return;
     }
 
@@ -86,7 +115,7 @@ void send_404(int client_fd, struct sockaddr_in client_addr, const char *path) {
     if (stat(error_path, &st) == -1) {
         close(fd);
         const char *msg = "HTTP/1.1 404 Not Found\r\nContent-Length: 13\r\nContent-Type: text/plain\r\n\r\n404 Not Found";
-        write(client_fd, msg, strlen(msg));
+        ssl_write(ssl, client_fd, msg, strlen(msg));
         return;
     }
 
@@ -97,12 +126,12 @@ void send_404(int client_fd, struct sockaddr_in client_addr, const char *path) {
              "Content-Type: text/html\r\n"
              "Connection: close\r\n\r\n",
              st.st_size);
-    write(client_fd, header, strlen(header));
+    ssl_write(ssl, client_fd, header, strlen(header));
 
     char buffer[BUFFER_SIZE];
     int bytes_read;
     while ((bytes_read = read(fd, buffer, BUFFER_SIZE)) > 0) {
-        write(client_fd, buffer, bytes_read);
+        ssl_write(ssl, client_fd, buffer, bytes_read);
     }
     close(fd);
 
@@ -111,12 +140,12 @@ void send_404(int client_fd, struct sockaddr_in client_addr, const char *path) {
     log_request(client_ip, "GET", path, 404);
 }
 
-void send_403(int client_fd) {
+void send_403(int client_fd, SSL *ssl) {
     const char *error_path = WEB_ROOT "/403.html";
     int fd = open(error_path, O_RDONLY);
     if (fd == -1) {
         const char *msg = "HTTP/1.1 403 Forbidden\r\nContent-Length: 10\r\nContent-Type: text/plain\r\n\r\n403 Forbidden";
-        write(client_fd, msg, strlen(msg));
+        ssl_write(ssl, client_fd, msg, strlen(msg));
         return;
     }
 
@@ -124,7 +153,7 @@ void send_403(int client_fd) {
     if (stat(error_path, &st) == -1) {
         close(fd);
         const char *msg = "HTTP/1.1 403 Forbidden\r\nContent-Length: 10\r\nContent-Type: text/plain\r\n\r\n403 Forbidden";
-        write(client_fd, msg, strlen(msg));
+        ssl_write(ssl, client_fd, msg, strlen(msg));
         return;
     }
 
@@ -135,12 +164,12 @@ void send_403(int client_fd) {
              "Content-Type: text/html\r\n"
              "Connection: close\r\n\r\n",
              st.st_size);
-    write(client_fd, header, strlen(header));
+    ssl_write(ssl, client_fd, header, strlen(header));
 
     char buffer[BUFFER_SIZE];
     int bytes_read;
     while ((bytes_read = read(fd, buffer, BUFFER_SIZE)) > 0) {
-        write(client_fd, buffer, bytes_read);
+        ssl_write(ssl, client_fd, buffer, bytes_read);
     }
     close(fd);
 }
@@ -158,10 +187,10 @@ void url_decode(char *dst, const char *src) {//no usage
     *dst = '\0';
 }
 
-void generate_directory_listing(int client_fd, const char *fs_path, const char *url_path, bool head_only) {
+void generate_directory_listing(int client_fd, SSL *ssl,const char *fs_path, const char *url_path, bool head_only) {
     DIR *dir = opendir(fs_path);
     if (!dir) {
-        send_404(client_fd, (struct sockaddr_in){0}, url_path);
+        send_404(client_fd, ssl, (struct sockaddr_in){0}, url_path);
         return;
     }
 
@@ -179,7 +208,7 @@ void generate_directory_listing(int client_fd, const char *fs_path, const char *
     struct dirent *entry;
     while ((entry = readdir(dir)) != NULL) {
         if (strcmp(entry->d_name, ".") == 0) continue;
-
+        if (offset >= sizeof(html) - 100) break;
         offset += snprintf(html + offset, sizeof(html) - offset,
             "<li><a href=\"%s%s%s\">%s</a></li>",
             url_path,
@@ -199,18 +228,25 @@ void generate_directory_listing(int client_fd, const char *fs_path, const char *
         "Connection: close\r\n\r\n",
          offset);
 
-        write(client_fd, header, strlen(header));
+        ssl_write(ssl, client_fd, header, strlen(header));
         if (!head_only)
-            write(client_fd, html, offset);
+            ssl_write(ssl, client_fd, html, offset);
 }
 
 bool is_valid_path(const char *path) {
+    if (!validate_http_path(path)) return false;
+
+    //Decode Url encoding properly
+    char decoded[PATH_MAX];
+    url_decode(decoded, path);
+    //check agian after decoding
+    if (strstr(decoded, "..") || strstr(decoded, "~")) return false;
    //Check for raw ".."
     if (strstr(path, "..") != NULL)
         return false;
 
     //Check for encoded "../" -> %2e%2e  or %2e%2e/
-    if (strcasestr(path, "%2e") != NULL)
+    if (strstr(path, "%2e") != NULL || strstr(path, "%2E") != NULL)
         return false;
         
     //Check resolved realpath is still under WEB_ROOT
@@ -224,7 +260,11 @@ bool is_valid_path(const char *path) {
 
     //Ensure resolved path is under WEB_ROOT
     char webroot_resolved[PATH_MAX];
-    realpath(WEB_ROOT, webroot_resolved);
+    if (realpath(WEB_ROOT, webroot_resolved) ==NULL)
+        {
+            perror("realpath failed");
+            return 0;
+        }
     if (strncmp(resolved,  webroot_resolved, strlen(webroot_resolved)) != 0) {
         return false;
     }
@@ -263,10 +303,41 @@ bool parse_request_line(const char *request_line, char *method, size_t method_si
     return true;
 }
 
-int server_file(int client_fd, const char *method, const char *path, struct sockaddr_in client_addr, bool head_only) {
+bool validate_http_method(const char *method) {
+    if (!method || strlen(method) > 16) return false;
+    return (strcmp(method, "GET") == 0 ||
+            strcmp(method, "POST") == 0 ||
+            strcmp(method, "HEAD") == 0); 
+}
+
+bool validate_http_path(const char *path) {
+    if (!path || strlen(path) > 2048) return false;
+    if (path[0] != '/') return false;
+
+    //Check for directory traversal
+    if(strstr(path, "../") || strstr(path, "..\\")) return false;
+    if(strstr(path, "%2e%2e")) return false;
+
+    return true;
+}
+
+bool validate_header_size(const char *buffer, int total_read) {
+    if (total_read > MAX_REQUEST_SIZE) return false;
+
+    char *header_end = strstr(buffer, "\r\n\r\n");
+    if (header_end && (header_end - buffer) > MAX_HEADER_SIZE) return false;
+
+    return true;
+}
+
+bool is_rated_limited(const char *client_ip) {
+    return false; // Disable rate limiting for now.
+}
+
+int server_file(int client_fd, SSL *ssl, const char *method, const char *path, struct sockaddr_in client_addr, bool head_only) {
     
     if (!is_valid_path(path)) {
-        send_403(client_fd);   
+        send_403(client_fd, ssl);   
         char client_ip[INET_ADDRSTRLEN];
         inet_ntop(AF_INET, &(client_addr.sin_addr), client_ip, INET_ADDRSTRLEN);
         log_request(client_ip, "INVALID", path, 403);
@@ -275,7 +346,7 @@ int server_file(int client_fd, const char *method, const char *path, struct sock
 
     char full_path[1024];
     if (strlen(WEB_ROOT) + strlen(path) >= sizeof(full_path)){
-        send_403(client_fd);
+        send_403(client_fd, ssl);
         return 403;
     }
     snprintf(full_path, sizeof(full_path), "%s%s", WEB_ROOT, path);
@@ -286,14 +357,14 @@ int server_file(int client_fd, const char *method, const char *path, struct sock
 
     int fd = open(full_path, O_RDONLY);
     if (fd == -1) {
-        send_404(client_fd, client_addr, path);
+        send_404(client_fd, ssl, client_addr, path);
         return 404;
     }
 
     struct stat st;
     if (stat(full_path, &st) == -1) {
         close(fd);
-        send_404(client_fd, client_addr, path);
+        send_404(client_fd, ssl, client_addr, path);
         return 404;
     }
     
@@ -307,14 +378,14 @@ int server_file(int client_fd, const char *method, const char *path, struct sock
             //serve index.html
             int index_fd = open(index_path, O_RDONLY);
             if (index_fd == -1) {
-                send_404(client_fd, client_addr, path);
+                send_404(client_fd, ssl, client_addr, path);
                 return 404;
             }
 
             struct stat index_stat;
             if (stat(index_path, &index_stat) == -1) {
                 close(index_fd);
-                send_404(client_fd, client_addr, path);
+                send_404(client_fd, ssl, client_addr, path);
                 return 404;
             }
 
@@ -326,21 +397,21 @@ int server_file(int client_fd, const char *method, const char *path, struct sock
                 "Cache-Control: public, max-age=86400\r\n"//caches for 1 day.
                 "Connection: close\r\n\r\n",
                 index_stat.st_size);
-            write(client_fd, header, strlen(header));
+            ssl_write(ssl, client_fd, header, strlen(header));
 
             if (!head_only) {
                 char file_buffer[BUFFER_SIZE];
                 int bytes_read;
                 while ((bytes_read = read(index_fd, file_buffer, BUFFER_SIZE)) > 0)
-                    write(client_fd, file_buffer, bytes_read);
+                    ssl_write(ssl, client_fd, file_buffer, bytes_read);
             }
 
             close(fd);//Close of the orginal directory fd
             close(index_fd); //Close of the index_fd
-            return -1;
+            return 200;
         } else {
             // No index.html -> genetate directory listing.
-            generate_directory_listing(client_fd, full_path, path, head_only);
+            generate_directory_listing(client_fd, ssl, full_path, path, head_only);
             close(fd);
             return 0;
         }
@@ -348,19 +419,24 @@ int server_file(int client_fd, const char *method, const char *path, struct sock
     // Save regular file
     char header[1024];
     snprintf(header, sizeof(header),
-            "HTTP/1.1 200 OK \r\n"
+            "HTTP/1.1 200 OK\r\n"
             "Content-Length: %ld\r\n"
             "Content-Type: %s\r\n"
+            "X-Content-Type-Options: nosniff\r\n"          
+            "X-Frame-Options: DENY\r\n"                    
+            "X-XSS-Protection: 1; mode=block\r\n"          
+            "Strict-Transport-Security: max-age=31536000\r\n"
+            "Content-Security-Policy: default-src 'self'\r\n" 
             "Cache-Control: public, max-age=86400\r\n"//Caches for 1 day
             "Connection: close\r\n\r\n",
             st.st_size, get_mime_type(full_path));
-    write(client_fd, header, strlen(header));
+    ssl_write(ssl, client_fd, header, strlen(header));
 
     if (!head_only) {
         char file_buffer[BUFFER_SIZE];
         int bytes_read;
         while ((bytes_read = read(fd, file_buffer, BUFFER_SIZE)) > 0)
-            write(client_fd, file_buffer, bytes_read);
+            ssl_write(ssl, client_fd, file_buffer, bytes_read);
     }
 
     close(fd);
@@ -386,14 +462,13 @@ void log_request(const char *client_ip, const char *method, const char *path, in
     pthread_mutex_unlock(&log_mutex);
 }
 
-void enqueue(int client_fd, struct sockaddr_in client_addr) {
+void enqueue_task(client_task_t task) {
     pthread_mutex_lock(&queue_mutex);
     while (queue_count == QUEUE_SIZE) {
         pthread_cond_wait(&queue_not_full, &queue_mutex);
     }
 
-    client_queue[queue_rear].client_fd = client_fd;
-    client_queue[queue_rear].client_addr = client_addr;
+    client_queue[queue_rear] = task;
     queue_rear = (queue_rear + 1) % QUEUE_SIZE;
     queue_count ++;
 
@@ -426,9 +501,25 @@ void *worker_thread(void *arg) {
     char buffer[BUFFER_SIZE];
     http_header_t headers[MAX_HEADERS];
     int header_count = 0;
+    int status_code = 500;
 
     while(running) {
         client_task_t task = dequeue();
+        if (task.is_https && ssl_ctx) {
+            task.ssl = SSL_new(ssl_ctx);
+            if (!task.ssl) {
+                close(task.client_fd);
+                continue;
+            }
+            SSL_set_fd(task.ssl, task.client_fd);
+
+            if (SSL_accept(task.ssl) <= 0) {
+                ERR_print_errors_fp(stderr);
+                SSL_free(task.ssl);
+                close(task.client_fd);
+                continue;
+            }
+        }
         if (task.client_fd == -1) break;// Shutdown signal - exit thread.
 
         int total_read = 0;
@@ -436,7 +527,7 @@ void *worker_thread(void *arg) {
 
         // Read headers fully first:
         while (total_read < BUFFER_SIZE - 1) {
-            int r = read(task.client_fd, buffer + total_read, BUFFER_SIZE - 1 - total_read);
+            int r = ssl_read(task.ssl, task.client_fd, buffer + total_read, BUFFER_SIZE - 1 - total_read);
             if (r <= 0) {
                 close(task.client_fd);
                 return NULL;
@@ -452,12 +543,25 @@ void *worker_thread(void *arg) {
         }
 
         // Parse request line 
-        char method[8], path[1024], version[16];
+        char method[17], path[2049], version[16];
         char *saveptr;
         char *line = strtok_r(buffer, "\r\n", &saveptr);
-        if (!line || sscanf(line, "%7s %1023s %15s", method, path, version) != 3) {
-            const char *msg = "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n";
-            write(task.client_fd, msg, strlen(msg));
+        if (sscanf(line, "%16s %2049s %15s", method, path, version) != 3) {
+            const char *msg = "HTTP/1.1 400 Bad Request\r\n\r\n";
+            ssl_write(task.ssl, task.client_fd, msg, strlen(msg));
+            close(task.client_fd);
+            continue;
+        }
+
+        if (!validate_http_method(method)) {
+            const char *msg = "HTTP/1.1 405 Method Not Allowed\r\n\r\n";
+            ssl_write(task.ssl, task.client_fd, msg, strlen(msg));
+            close(task.client_fd);
+            continue;
+        }
+        if (!validate_http_path(path)) {
+            const char *msg = "HTTP/1.1 400 Bad Request\r\n\r\n";
+            ssl_write(task.ssl, task.client_fd, msg, strlen(msg));
             close(task.client_fd);
             continue;
         }
@@ -465,7 +569,13 @@ void *worker_thread(void *arg) {
         header_count = 0;
         while ((line = strtok_r(NULL, "\r\n", &saveptr)) && header_count < MAX_HEADERS)
         {
-            if (line[0] == '\0') break;// End of headers.
+            if (strlen(line) > MAX_HEADER_VALUE_LENGTH) {
+                //if header to long - reject
+                const char *msg = "HTTP/1.1 431 Request Header Fields Too Large\r\n\r\n";
+                ssl_write(task.ssl, task.client_fd, msg, strlen(msg));
+                close(task.client_fd);
+                goto cleanup;
+            }
 
             char *sep = strchr(line, ':');
             if (sep && sep != line) {
@@ -499,22 +609,22 @@ void *worker_thread(void *arg) {
                 }
             }
 
-            if (content_length <= 0 || content_length > 10 * 1024 * 1024) {
+            if (content_length <= 0 || content_length > 1024 * 1024) {//1MB Limit
                 const char *msg = "HTTP/1.1 411 Length Required\r\nContent-Length: 0\r\n\r\n";
-                write(task.client_fd, msg, strlen(msg));
+                ssl_write(task.ssl, task.client_fd, msg, strlen(msg));
                 shutdown(task.client_fd, SHUT_WR);
                 close(task.client_fd);
-                return NULL;
+                continue;;
             }
 
             char *body = malloc(content_length + 1);
             if (!body) {
                 //Handle memory failure
                 const char *msg = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n";
-                write(task.client_fd, msg, strlen(msg));
+                ssl_write(task.ssl, task.client_fd, msg, strlen(msg));
                 shutdown(task.client_fd, SHUT_WR);
                 close(task.client_fd);
-                return NULL;
+                continue;;
             }
             // Calc how many body bytes we already have in buffer.
             int body_in_buffer = total_read - header_end;
@@ -525,7 +635,7 @@ void *worker_thread(void *arg) {
 
             int body_received = body_in_buffer;
             while (body_received < content_length) {
-                int r = read(task.client_fd, body + body_received, content_length - body_received);
+                int r = ssl_read(task.ssl, task.client_fd, body + body_received, content_length - body_received);
                 if (r <= 0) break;
                 body_received += r;
             }
@@ -551,22 +661,25 @@ void *worker_thread(void *arg) {
             free(body);
             shutdown(task.client_fd, SHUT_WR);
             close(task.client_fd);
-            return NULL; // EXIT cleanly
+            return 0; // EXIT cleanly
         }
         
-        // Default to 404 if method is unsupported
-        int status_code = 404;
+        status_code = 200;
         if (strcmp(method, "GET") == 0 || strcmp(method, "HEAD") == 0) {
-            status_code = server_file(task.client_fd, method, path, task.client_addr, strcmp(method, "HEAD") == 0);
+            status_code = server_file(task.client_fd, task.ssl, method, path, task.client_addr, strcmp(method, "HEAD") == 0);
         } else {
             const char *msg = 
                 "HTTP/1.1 405 Method Not Allowed\r\n"
                 "Allow: GET, HEAD, POST\r\n"
                 "Content-Length: 0\r\n\r\n";
-            write(task.client_fd, msg, strlen(msg));
+            ssl_write(task.ssl, task.client_fd, msg, strlen(msg));
             status_code = 405;
         }
-    
+        cleanup:
+        if (task.ssl) {
+            SSL_shutdown(task.ssl);
+            SSL_free(task.ssl);
+        }
         log_request(client_ip, method, path, status_code);
         close(task.client_fd);
         }
@@ -575,7 +688,13 @@ void *worker_thread(void *arg) {
 }
 
 int main() {
-    
+    //SSl initialization
+    SSL_library_init();
+    SSL_load_error_strings();
+    ssl_ctx = SSL_CTX_new(TLS_server_method());
+    SSL_CTX_use_certificate_file(ssl_ctx, "server.crt", SSL_FILETYPE_PEM);
+    SSL_CTX_use_PrivateKey_file(ssl_ctx, "server.key", SSL_FILETYPE_PEM);
+
     struct sockaddr_in client_addr;
     socklen_t addr_len = sizeof(client_addr);
 
@@ -596,7 +715,7 @@ int main() {
 
     struct sockaddr_in server_addr;
     server_addr.sin_family = AF_INET;
-    server_addr.sin_port = htons(PORT);
+    server_addr.sin_port = htons(HTTPS_PORT);
     server_addr.sin_addr.s_addr = INADDR_ANY;
 
     if (bind(server_fd, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
@@ -610,9 +729,6 @@ int main() {
         exit(EXIT_FAILURE);
     }
 
-    //bind(server_fd, (struct sockaddr*)&server_addr, sizeof(server_addr));
-    //listen(server_fd, 10);
-
     log_file = fopen("access.log", "a");
     if (!log_file) {
         perror("fopen log file");
@@ -624,36 +740,90 @@ int main() {
         pthread_create(&thread_pool[i], NULL, worker_thread, NULL);
     }
 
-    printf("Static file server running on http://localhost:%d\n", PORT);
+    int https_server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (https_server_fd == -1){
+        perror("https socket");
+        exit(EXIT_FAILURE);
+    }
+    setsockopt(https_server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    struct sockaddr_in https_server_addr;
+    https_server_addr.sin_family = AF_INET;
+    https_server_addr.sin_port = htons(HTTP_PORT);
+    https_server_addr.sin_addr.s_addr = INADDR_ANY;
+
+    if (bind(https_server_fd, (struct sockaddr*)&https_server_addr, sizeof(https_server_addr)) < 0){
+        perror("https bind");
+        close(https_server_fd);
+        exit(EXIT_FAILURE);
+    }
+    if (listen(https_server_fd, 10) < 0) {
+        perror("https listen");
+        close(https_server_fd);
+        exit(EXIT_FAILURE);
+    }
+
+    printf("Static file server running on http://localhost:%d\n", HTTPS_PORT);
+
+    struct pollfd pfds[2];
+    pfds[0].fd = server_fd;
+    pfds[0].events = POLLIN;
+    pfds[1].fd = https_server_fd;
+    pfds[1].events = POLLIN;
 
     while (running) {
-        struct pollfd pfd = {
-            .fd = server_fd,
-            .events = POLLIN
-        };
-        
-            int ret = poll(&pfd, 1, 500); //Wait up to 500ms
-            if (ret > 0 && (pfd.revents & POLLIN)) {
-                int client_fd = accept(server_fd,(struct sockaddr*)&client_addr, &addr_len);
+        int ret = poll(pfds, 2, 500);
+        if (ret > 0) {
+            //Handle HTTP connections
+            if (pfds[0].revents & POLLIN) {
+                int client_fd = accept(server_fd, (struct sockaddr*)&client_addr, &addr_len);
                 if (client_fd >= 0) {
-                    enqueue(client_fd, client_addr);
-                } else {
-                    if (running) perror("accept");
+                    client_task_t task = {
+                        .client_fd = client_fd,
+                        .ssl = NULL,
+                        .client_addr = client_addr,
+                        .is_https = false
+                    };
+                    enqueue_task(task);
                 }
             }
+
+            //Handle HTTPS connections
+            if (pfds[1].revents & POLLIN) {
+                int client_fd = accept(https_server_fd, (struct sockaddr*)&client_addr, &addr_len);
+                if (client_fd >= 0) {
+                    client_task_t task = {
+                        .client_fd = client_fd,
+                        .ssl = NULL,
+                        .client_addr = client_addr,
+                        .is_https = true
+                    };
+                    enqueue_task(task);
+                }
+            }
+        }    
     }
     printf("Almost done...\n");
     close(server_fd);
        
     // Signal threads to exit by enqueuing poison pills.
     for (int i = 0; i < THREAD_POOL_SIZE; i++) {
-        enqueue(-1, (struct sockaddr_in){0});
+        client_task_t poison_pill = {
+            .client_fd = -1,
+            .client_addr = {0}
+        };
+        enqueue_task(poison_pill);
     }
 
     for (int i = 0; i < THREAD_POOL_SIZE; i++) {
         pthread_join(thread_pool[i], NULL);
     }
     printf("Server shutdown complete.\n");
+    if (ssl_ctx) {
+        SSL_CTX_free(ssl_ctx);
+    }
+    fclose(log_file);
+    close(https_server_fd);
     return 0;
 }
-//i need to get out, have a drink, or smthing ,idk!
+// server take long time to shut down...??
