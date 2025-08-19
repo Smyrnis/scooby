@@ -2,19 +2,42 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <arpa/inet.h>
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdbool.h>
-#include <poll.h>
 #include <dirent.h>
 #include <time.h>
 #include <ctype.h>
-#include <linux/limits.h>
+#include <limits.h>
 #include <openssl/ssl.h>
 #include <openssl/err.h>
+
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <windows.h>
+
+#ifndef SHUT_RD
+#define SHUT_RD SD_RECEIVE
+#endif
+#ifndef SHUT_WR
+#define SHUT_WR SD_SEND
+#endif
+#ifndef SHUT_RDWR
+#define SHUT_RDWR SD_BOTH
+#endif
+
+#else
+#include <unistd.h>
+#include <arpa/inet.h>
+#include <poll.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#endif
+
+
 
 #define HTTP_PORT 8080
 #define HTTPS_PORT 8443
@@ -30,6 +53,180 @@
 #define MAX_METHOD_LENGTH 16
 #define MAX_HEADER_NAME_LENGTH 128
 #define MAX_HEADER_VALUE_LENGTH 4096
+
+// --------- Functions that need recognition --------------
+
+void send_404(int client_fd, SSL *ssl, struct sockaddr_in client_addr, const char *path);
+int ssl_write(SSL *ssl, int fd, const void *buf, int len);
+
+// -------------------------------------------------------
+int execute_php(int client_fd, SSL *ssl, const char *method, const char *path, 
+                struct sockaddr_in client_addr, const char *body, int body_len) {
+
+    char script_path[PATH_MAX];
+    snprintf(script_path, sizeof(script_path), "%s%s", WEB_ROOT, path);
+
+    struct stat st;
+    if (stat(script_path, &st) != 0) {
+        send_404(client_fd, ssl, client_addr, path);
+        return 404;
+    }
+
+#ifdef _WIN32
+    // Windows Implementation
+    HANDLE hStdInRead, hStdInWrite;
+    HANDLE hStdOutRead, hStdOutWrite;
+    SECURITY_ATTRIBUTES sa = { sizeof(SECURITY_ATTRIBUTES), NULL, TRUE };
+
+    if (!CreatePipe(&hStdInRead, &hStdInWrite, &sa, 0)) return 500;
+    if (!CreatePipe(&hStdOutRead, &hStdOutWrite, &sa, 0)) return 500;
+
+    STARTUPINFO si = {0};
+    PROCESS_INFORMATION pi = {0};
+    si.cb = sizeof(si);
+    si.hStdInput = hStdInRead;
+    si.hStdOutput = hStdOutWrite;
+    si.hStdError = hStdOutWrite;
+    si.dwFlags |= STARTF_USESTDHANDLES;
+
+    char cmd[PATH_MAX + 64];
+    snprintf(cmd, sizeof(cmd), "php-cgi.exe -f \"%s\"", script_path);
+
+    // Environment variables
+    SetEnvironmentVariable("REQUEST_METHOD", method);
+    SetEnvironmentVariable("SCRIPT_FILENAME", script_path);
+    SetEnvironmentVariable("SERVER_PROTOCOL", "HTTP/1.1");
+    SetEnvironmentVariable("REDIRECT_STATUS", "200");
+    char content_length_str[32];
+    snprintf(content_length_str, sizeof(content_length_str), "%d", body_len);
+    SetEnvironmentVariable("CONTENT_LENGTH", content_length_str);
+
+    if (!CreateProcess(NULL, cmd, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi)) {
+        CloseHandle(hStdInRead); CloseHandle(hStdInWrite);
+        CloseHandle(hStdOutRead); CloseHandle(hStdOutWrite);
+        return 500;
+    }
+
+    // Send POST body if any
+    if (body && body_len > 0) {
+        DWORD written;
+        WriteFile(hStdInWrite, body, body_len, &written, NULL);
+    }
+    CloseHandle(hStdInWrite);
+    CloseHandle(hStdInRead);
+
+    // Read all output
+    char buffer[65536];
+    DWORD total = 0, n;
+    char php_output[65536] = {0};
+    while (ReadFile(hStdOutRead, buffer, sizeof(buffer), &n, NULL) && n > 0) {
+        if (total + n < sizeof(php_output)) {
+            memcpy(php_output + total, buffer, n);
+            total += n;
+        }
+    }
+    CloseHandle(hStdOutRead);
+    CloseHandle(hStdOutWrite);
+
+    // Find body after PHP headers
+    char *body_start = strstr(php_output, "\r\n\r\n");
+    if (!body_start) body_start = strstr(php_output, "\n\n");
+    if (!body_start) body_start = php_output;
+    else body_start += (body_start[1] == '\n') ? 2 : 4;
+
+    // Send proper HTTP headers
+    char http_header[512];
+    snprintf(http_header, sizeof(http_header),
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: text/html\r\n"
+        "Content-Length: %ld\r\n"
+        "\r\n", total - (body_start - php_output));
+
+    ssl_write(ssl, client_fd, http_header, strlen(http_header));
+    ssl_write(ssl, client_fd, body_start, total - (body_start - php_output));
+
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+
+#else
+    // Linux / MacOS Implementation
+    int pipe_in[2], pipe_out[2];
+    if (pipe(pipe_in) < 0 || pipe(pipe_out) < 0) return 500;
+
+    pid_t pid = fork();
+    if (pid < 0) return 500;
+
+    if (pid == 0) { // child
+        dup2(pipe_in[0], STDIN_FILENO);
+        dup2(pipe_out[1], STDOUT_FILENO);
+        close(pipe_in[1]);
+        close(pipe_out[0]);
+
+        setenv("REQUEST_METHOD", method, 1);
+        setenv("SCRIPT_FILENAME", script_path, 1);
+        setenv("SERVER_PROTOCOL", "HTTP/1.1", 1);
+        setenv("REDIRECT_STATUS", "200", 1);
+
+        char content_length_str[32];
+        snprintf(content_length_str, sizeof(content_length_str), "%d", body_len);
+        setenv("CONTENT_LENGTH", content_length_str, 1);
+
+        execlp("php-cgi", "php-cgi", NULL);
+        perror("execlp");
+        exit(1);
+    } else { // parent
+        close(pipe_in[0]);
+        close(pipe_out[1]);
+
+        if (body && body_len > 0) {
+            ssize_t written = 0;
+            while (written < body_len) {
+                ssize_t n = write(pipe_in[1], body + written, body_len - written);
+                if (n <= 0) break;
+                written += n;
+            }
+        }
+        close(pipe_in[1]);
+
+        // Read all output from PHP-CGI
+        char buffer[65536];
+        ssize_t total = 0, n;
+        char php_output[65536] = {0};
+        while ((n = read(pipe_out[0], buffer, sizeof(buffer))) > 0) {
+            if (total + n < sizeof(php_output)) {
+                memcpy(php_output + total, buffer, n);
+                total += n;
+            }
+        }
+        close(pipe_out[0]);
+
+        // Find body start
+        char *body_start = strstr(php_output, "\r\n\r\n");
+        if (!body_start) body_start = strstr(php_output, "\n\n");
+        if (!body_start) body_start = php_output;
+        else body_start += (body_start[1] == '\n') ? 2 : 4;
+
+        // Send proper HTTP response over SSL
+        char http_header[512];
+        snprintf(http_header, sizeof(http_header),
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: text/html\r\n"
+            "Content-Length: %ld\r\n"
+            "\r\n", total - (body_start - php_output));
+
+        ssl_write(ssl, client_fd, http_header, strlen(http_header));
+        ssl_write(ssl, client_fd, body_start, total - (body_start - php_output));
+
+        waitpid(pid, NULL, 0);
+    }
+#endif
+
+    return 200;
+}
+
+
+int http_server_fd, https_server_fd;
 
 SSL_CTX *ssl_ctx = NULL;
 
@@ -50,7 +247,6 @@ typedef struct {
 } client_task_t;
 void enqueue_task(client_task_t task);
 
-int server_fd;
 volatile bool running = true;//Server running flag.
 
 client_task_t client_queue[QUEUE_SIZE];
@@ -447,6 +643,11 @@ int server_file(int client_fd, SSL *ssl, const char *method, const char *path, s
 void handle_sigint(int sig) {
     printf("\nShutting down server gracefully...\n");
     running = false;
+    // Close server sockets immediately to stop accepting new connections
+    close(http_server_fd);
+    close(https_server_fd);
+    // wake all waiting threads
+    pthread_cond_broadcast(&queue_not_empty);
     pthread_cond_broadcast(&queue_not_empty); // Wake all threads
 }
 
@@ -599,9 +800,11 @@ void *worker_thread(void *arg) {
         char client_ip[INET_ADDRSTRLEN];
         inet_ntop(AF_INET, &(task.client_addr.sin_addr), client_ip, INET_ADDRSTRLEN);
 
+        char *body = NULL;
+        int content_length = 0;
         // POST method..Handle 
         if(strcmp(method, "POST") == 0) {
-            int content_length = 0;
+            //int content_length = 0;
             for (int i = 0; i < header_count; i++) {
                 if (strcasecmp(headers[i].key, "Content-Length") == 0) {
                     content_length = atoi(headers[i].value);
@@ -665,8 +868,12 @@ void *worker_thread(void *arg) {
         }
         
         status_code = 200;
-        if (strcmp(method, "GET") == 0 || strcmp(method, "HEAD") == 0) {
+        if (strcmp(method, "GET") == 0 || strcmp(method, "HEAD") == 0 || strcmp(method, "POST") == 0) {
+            if (strstr(path, ".php")) {
+                status_code = execute_php(task.client_fd, task.ssl, method, path, task.client_addr, body, content_length);
+            } else {
             status_code = server_file(task.client_fd, task.ssl, method, path, task.client_addr, strcmp(method, "HEAD") == 0);
+            }
         } else {
             const char *msg = 
                 "HTTP/1.1 405 Method Not Allowed\r\n"
@@ -677,7 +884,7 @@ void *worker_thread(void *arg) {
         }
         cleanup:
         if (task.ssl) {
-            SSL_shutdown(task.ssl);
+            SSL_set_shutdown(task.ssl, SSL_SENT_SHUTDOWN | SSL_RECEIVED_SHUTDOWN);
             SSL_free(task.ssl);
         }
         log_request(client_ip, method, path, status_code);
@@ -691,43 +898,132 @@ int main() {
     //SSl initialization
     SSL_library_init();
     SSL_load_error_strings();
+    OpenSSL_add_all_algorithms();
+
     ssl_ctx = SSL_CTX_new(TLS_server_method());
-    SSL_CTX_use_certificate_file(ssl_ctx, "server.crt", SSL_FILETYPE_PEM);
-    SSL_CTX_use_PrivateKey_file(ssl_ctx, "server.key", SSL_FILETYPE_PEM);
-
-    struct sockaddr_in client_addr;
-    socklen_t addr_len = sizeof(client_addr);
-
-    server_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (server_fd == -1) {
-        perror("socket");
+    if (!ssl_ctx) {
+        ERR_print_errors_fp(stderr);
         exit(EXIT_FAILURE);
     }
 
+    // Configure SSl
+    SSL_CTX_set_min_proto_version(ssl_ctx, TLS1_2_VERSION);
+    SSL_CTX_set_cipher_list(ssl_ctx,  "ECDHE+AESGCM:ECDHE+CHACHA20:DHE+AESGCM:DHE+CHACHA20:!aNULL:!MD5:!DSS");
+    SSL_CTX_set_ecdh_auto(ssl_ctx, 1);
+
+    //load certificate and key
+    if (SSL_CTX_use_certificate_file(ssl_ctx, "server.crt", SSL_FILETYPE_PEM) <= 0) {
+        ERR_print_errors_fp(stderr);
+        fprintf(stderr, "Error: Cannot load certificate file 'server.crt'\n");
+        exit(EXIT_FAILURE);
+    }
+
+    if (SSL_CTX_use_PrivateKey_file(ssl_ctx, "server.key", SSL_FILETYPE_PEM) <= 0) {
+        ERR_print_errors_fp(stderr);
+        fprintf(stderr, "Error: Cannot load private key 'server.key'\n");
+        exit(EXIT_FAILURE);
+    }
+
+    //Verify key matches to certificate
+    if (!SSL_CTX_check_private_key(ssl_ctx)) {
+        fprintf(stderr, "Privateo key does not match cerificate\n");
+        exit(EXIT_FAILURE);
+    }
+
+    printf("SSL context initialized successfully\n");
+
+    struct sockaddr_in client_addr;
+    socklen_t addr_len = sizeof(client_addr);
     int opt = 1;
-    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt))) {
+
+    //create HTTP server socket
+    http_server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (http_server_fd == -1) {
+        perror("http socket");
+        exit(EXIT_FAILURE);
+    }
+    
+    if (setsockopt(http_server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt))){
+        perror("http setsockopt");
+        close(http_server_fd);
+        exit(EXIT_FAILURE);
+    }
+    // create HTTPS server socket
+    https_server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (https_server_fd == -1){
+        perror("https setsockopt");
+        close(http_server_fd);
+        close(https_server_fd);
+        exit(EXIT_FAILURE);
+    }
+
+    signal(SIGINT, handle_sigint);
+
+    //bind HTTP server port:8080
+    struct sockaddr_in http_server_addr;
+    http_server_addr.sin_family = AF_INET;
+    http_server_addr.sin_port = htons(HTTP_PORT); //8080
+    http_server_addr.sin_addr.s_addr = INADDR_ANY;
+
+    if (bind(http_server_fd, (struct sockaddr*)&http_server_addr, sizeof(http_server_addr)) < 0) {
+    perror("http bind");
+    close(http_server_fd);
+    close(https_server_fd);
+    exit(EXIT_FAILURE);
+}
+
+if (listen(http_server_fd, 10) < 0) {
+    perror("http listen");
+    close(http_server_fd);
+    close(https_server_fd);
+    exit(EXIT_FAILURE);
+}
+
+// Bind HTTPS server (port 8443)
+struct sockaddr_in https_server_addr;
+https_server_addr.sin_family = AF_INET;
+https_server_addr.sin_port = htons(HTTPS_PORT);  // 8443
+https_server_addr.sin_addr.s_addr = INADDR_ANY;
+
+if (bind(https_server_fd, (struct sockaddr*)&https_server_addr, sizeof(https_server_addr)) < 0) {
+    perror("https bind");
+    close(http_server_fd);
+    close(https_server_fd);
+    exit(EXIT_FAILURE);
+}
+
+if (listen(https_server_fd, 10) < 0) {
+    perror("https listen");
+    close(http_server_fd);
+    close(https_server_fd);
+    exit(EXIT_FAILURE);
+}
+
+// Setup logging and thread pool (your existing code continues here)
+log_file = fopen("access.log", "a");
+if (!log_file) {
+    perror("fopen log file");
+    exit(EXIT_FAILURE);
+}
+
+printf("Static file server running on http://localhost:%d and https://localhost:%d\n", 
+       HTTP_PORT, HTTPS_PORT);
+
+// Setup polling
+struct pollfd pfds[2];
+pfds[0].fd = http_server_fd;
+pfds[0].events = POLLIN;
+pfds[1].fd = https_server_fd;
+pfds[1].events = POLLIN;
+
+    //int opt = 1
+    if (setsockopt(http_server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt))) {
         perror("setsocketopt");
-        close(server_fd);
+        close(http_server_fd);
         exit(EXIT_FAILURE);
     }
 
     signal(SIGINT, handle_sigint); // Catch Ctrl + C
-
-    struct sockaddr_in server_addr;
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_port = htons(HTTPS_PORT);
-    server_addr.sin_addr.s_addr = INADDR_ANY;
-
-    if (bind(server_fd, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
-        perror("bind");
-        close(server_fd);
-        exit(EXIT_FAILURE);
-    }
-    if (listen(server_fd, 10) < 0) {
-        perror("listen");
-        close(server_fd);
-        exit(EXIT_FAILURE);
-    }
 
     log_file = fopen("access.log", "a");
     if (!log_file) {
@@ -738,45 +1034,14 @@ int main() {
     pthread_t thread_pool[THREAD_POOL_SIZE];
     for (int i = 0; i < THREAD_POOL_SIZE; i++) {
         pthread_create(&thread_pool[i], NULL, worker_thread, NULL);
-    }
-
-    int https_server_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (https_server_fd == -1){
-        perror("https socket");
-        exit(EXIT_FAILURE);
-    }
-    setsockopt(https_server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-
-    struct sockaddr_in https_server_addr;
-    https_server_addr.sin_family = AF_INET;
-    https_server_addr.sin_port = htons(HTTP_PORT);
-    https_server_addr.sin_addr.s_addr = INADDR_ANY;
-
-    if (bind(https_server_fd, (struct sockaddr*)&https_server_addr, sizeof(https_server_addr)) < 0){
-        perror("https bind");
-        close(https_server_fd);
-        exit(EXIT_FAILURE);
-    }
-    if (listen(https_server_fd, 10) < 0) {
-        perror("https listen");
-        close(https_server_fd);
-        exit(EXIT_FAILURE);
-    }
-
-    printf("Static file server running on http://localhost:%d\n", HTTPS_PORT);
-
-    struct pollfd pfds[2];
-    pfds[0].fd = server_fd;
-    pfds[0].events = POLLIN;
-    pfds[1].fd = https_server_fd;
-    pfds[1].events = POLLIN;
+    };
 
     while (running) {
         int ret = poll(pfds, 2, 500);
         if (ret > 0) {
             //Handle HTTP connections
             if (pfds[0].revents & POLLIN) {
-                int client_fd = accept(server_fd, (struct sockaddr*)&client_addr, &addr_len);
+                int client_fd = accept(http_server_fd, (struct sockaddr*)&client_addr, &addr_len);
                 if (client_fd >= 0) {
                     client_task_t task = {
                         .client_fd = client_fd,
@@ -804,7 +1069,7 @@ int main() {
         }    
     }
     printf("Almost done...\n");
-    close(server_fd);
+    close(http_server_fd);
        
     // Signal threads to exit by enqueuing poison pills.
     for (int i = 0; i < THREAD_POOL_SIZE; i++) {
@@ -826,4 +1091,5 @@ int main() {
     close(https_server_fd);
     return 0;
 }
-// server take long time to shut down...??
+// todo: fix some errors. 
+//      add the new features.

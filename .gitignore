@@ -21,7 +21,7 @@
 *.a
 *.la
 *.lo
-
+*.h
 # Shared objects (inc. Windows DLLs)
 *.dll
 *.so
@@ -53,3 +53,12 @@ dkms.conf
 
 # debug information files
 *.dwo
+
+# private key files
+*.key
+
+# certificate files
+*.crt
+
+# ignore the .log files
+*.log

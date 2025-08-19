@@ -54,3 +54,6 @@ p:hover, footer p:hover {
     color: #ffcc00;
     transition: color 0.3s ease;
 }
+a {
+    text-decoration: none;
+}
