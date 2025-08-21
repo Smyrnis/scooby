@@ -1,3 +1,5 @@
+// The code is a mess i have to make it look prettier.
+// Break it more files (maybe?)
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1092,4 +1094,5 @@ pfds[1].events = POLLIN;
     return 0;
 }
 // todo: fix some errors. 
+
 //      add the new features.
